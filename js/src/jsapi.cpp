@@ -93,80 +93,6 @@
 #include "vm/ObjectImpl-inl.h"
 #include "vm/String-inl.h"
 
-#include <functional>
-#include <queue>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include "Any.hpp"
-
-std::queue<boost::any> gInvokeFuncs;
-
-std::mutex gInvokerMutex;
-std::condition_variable gInvokerEvent;
-std::thread::id gOwnerThreadID;
-
-template <typename R>
-struct InvokeProxy
-{
-    static_assert(std::is_pod<R>::value, "Should be POD");
-
-    std::function<R (void)> Func;
-    R RetVal;
-
-    InvokeProxy(std::function<R(void)> func) :
-        Func(func)
-    {}
-
-    void Invoke()
-    {
-        RetVal = Func();
-    }
-};
-
-template <>
-struct InvokeProxy<void>
-{
-    std::function<void (void)> Func;
-
-    InvokeProxy(std::function<void (void)> func) :
-        Func(func)
-    {}
-
-    void Invoke()
-    {
-        Func();
-    }
-};
-
-static bool NeedInvoke()
-{
-    return gOwnerThreadID != std::this_thread::get_id();
-}
-
-template <typename R>
-static R PerformCrossThreadCall(std::function<R(void)> func) {
-    std::unique_lock<std::mutex> lock(gInvokerMutex);
-
-    auto p = new InvokeProxy<R>(func);
-    gInvokeFuncs.push(p);
-    gInvokerEvent.wait(lock);
-    R retVal = p->RetVal;
-    delete p;
-    return retVal;
-}
-
-
-template <>
-static void PerformCrossThreadCall(std::function<void(void)> func) {
-    std::unique_lock<std::mutex> lock(gInvokerMutex);
-
-    auto p = new InvokeProxy<void>(func);
-    gInvokeFuncs.push(p);
-    gInvokerEvent.wait(lock);
-    delete p;
-}
-
 using namespace js;
 using namespace js::gc;
 using namespace js::types;
@@ -633,8 +559,6 @@ JS_Init(void)
     MOZ_ASSERT(!JSRuntime::hasLiveRuntimes(),
                "how do we have live runtimes before JS_Init?");
 
-    gOwnerThreadID = std::this_thread::get_id();
-
     PRMJ_NowInit();
 
 #ifdef DEBUG
@@ -663,37 +587,6 @@ JS_Init(void)
 
     jsInitState = Running;
     return true;
-}
-
-JS_PUBLIC_API(void)
-JS_Update(void)
-{
-    std::lock_guard<std::mutex> lock(gInvokerMutex);
-
-    while(!gInvokeFuncs.empty()) {
-        boost::any anyProxy = gInvokeFuncs.front(); gInvokeFuncs.pop();
-        InvokeProxy<bool>** boolProxy =  boost::any_cast<InvokeProxy<bool>*>(&anyProxy);
-        InvokeProxy<void>** voidProxy = boost::any_cast<InvokeProxy<void>*>(&anyProxy);
-        InvokeProxy<JSObject*>** jsObjectProxy = boost::any_cast<InvokeProxy<JSObject*>*>(&anyProxy);
-
-        if (boolProxy)
-        {
-            (*boolProxy)->Invoke();
-        }
-        else if (voidProxy)
-        {
-            (*voidProxy)->Invoke();
-        }
-        else if (jsObjectProxy)
-        {
-            (*jsObjectProxy)->Invoke();
-        }
-        else {
-            MOZ_ASSERT(false);
-        }
-    }
-
-    gInvokerEvent.notify_all();
 }
 
 JS_PUBLIC_API(void)
@@ -2586,29 +2479,21 @@ JS_FireOnNewGlobalObject(JSContext *cx, JS::HandleObject global)
 JS_PUBLIC_API(JSObject *)
 JS_NewObject(JSContext *cx, const JSClass *jsclasp, HandleObject proto, HandleObject parent)
 {
-    if (NeedInvoke()) {
-        return PerformCrossThreadCall<JSObject*>([&]() -> JSObject* {
-            return JS_NewObject(cx, jsclasp, proto, parent);
-        });
-    }
-    else
-    {
-        JS_ASSERT(!cx->runtime()->isAtomsCompartment(cx->compartment()));
-        AssertHeapIsIdle(cx);
-        CHECK_REQUEST(cx);
-        assertSameCompartment(cx, proto, parent);
+    JS_ASSERT(!cx->runtime()->isAtomsCompartment(cx->compartment()));
+    AssertHeapIsIdle(cx);
+    CHECK_REQUEST(cx);
+    assertSameCompartment(cx, proto, parent);
 
-        const Class *clasp = Valueify(jsclasp);
-        if (!clasp)
-            clasp = &JSObject::class_;    /* default class is Object */
+    const Class *clasp = Valueify(jsclasp);
+    if (!clasp)
+        clasp = &JSObject::class_;    /* default class is Object */
 
-        JS_ASSERT(clasp != &JSFunction::class_);
-        JS_ASSERT(!(clasp->flags & JSCLASS_IS_GLOBAL));
+    JS_ASSERT(clasp != &JSFunction::class_);
+    JS_ASSERT(!(clasp->flags & JSCLASS_IS_GLOBAL));
 
-        JSObject *obj = NewObjectWithClassProto(cx, clasp, proto, parent);
-        JS_ASSERT_IF(obj, obj->getParent());
-        return obj;
-    }
+    JSObject *obj = NewObjectWithClassProto(cx, clasp, proto, parent);
+    JS_ASSERT_IF(obj, obj->getParent());
+    return obj;
 }
 
 JS_PUBLIC_API(JSObject *)
@@ -4597,22 +4482,14 @@ bool
 JS::Compile(JSContext *cx, HandleObject obj, const ReadOnlyCompileOptions &options,
             SourceBufferHolder &srcBuf, MutableHandleScript script)
 {
-    if (NeedInvoke()) {
-        return PerformCrossThreadCall<bool>([&]() -> bool {
-            return Compile(cx, obj, options, srcBuf, script);
-        });
-    }
-    else
-    {
-        JS_ASSERT(!cx->runtime()->isAtomsCompartment(cx->compartment()));
-        AssertHeapIsIdle(cx);
-        CHECK_REQUEST(cx);
-        assertSameCompartment(cx, obj);
-        AutoLastFrameCheck lfc(cx);
+    JS_ASSERT(!cx->runtime()->isAtomsCompartment(cx->compartment()));
+    AssertHeapIsIdle(cx);
+    CHECK_REQUEST(cx);
+    assertSameCompartment(cx, obj);
+    AutoLastFrameCheck lfc(cx);
 
-        script.set(frontend::CompileScript(cx, &cx->tempLifoAlloc(), obj, NullPtr(), options, srcBuf));
-        return !!script;
-    }
+    script.set(frontend::CompileScript(cx, &cx->tempLifoAlloc(), obj, NullPtr(), options, srcBuf));
+    return !!script;
 }
 
 bool
@@ -4902,23 +4779,14 @@ JS_DecompileFunctionBody(JSContext *cx, HandleFunction fun, unsigned indent)
 MOZ_NEVER_INLINE static bool
 ExecuteScript(JSContext *cx, HandleObject obj, HandleScript scriptArg, jsval *rval)
 {
-    if (NeedInvoke())
-    {
-        return PerformCrossThreadCall<bool>([&]() -> bool {
-            return ExecuteScript(cx, obj, scriptArg, rval);
-        });
-    }
-    else
-    {
-        RootedScript script(cx, scriptArg);
+    RootedScript script(cx, scriptArg);
 
-        JS_ASSERT(!cx->runtime()->isAtomsCompartment(cx->compartment()));
-        AssertHeapIsIdle(cx);
-        CHECK_REQUEST(cx);
-        assertSameCompartment(cx, obj, scriptArg);
-        AutoLastFrameCheck lfc(cx);
-        return Execute(cx, script, *obj, rval);
-    }
+    JS_ASSERT(!cx->runtime()->isAtomsCompartment(cx->compartment()));
+    AssertHeapIsIdle(cx);
+    CHECK_REQUEST(cx);
+    assertSameCompartment(cx, obj, scriptArg);
+    AutoLastFrameCheck lfc(cx);
+    return Execute(cx, script, *obj, rval);
 }
 
 MOZ_NEVER_INLINE JS_PUBLIC_API(bool)
@@ -5851,27 +5719,12 @@ JS_ParseJSONWithReviver(JSContext *cx, HandleString str, HandleValue reviver, Mu
 JS_PUBLIC_API(void)
 JS_ReportError(JSContext *cx, const char *format, ...)
 {
-    if (NeedInvoke())
-    {
-        va_list ap;
-        AssertHeapIsIdle(cx);
-        va_start(ap, format);
+    va_list ap;
 
-        PerformCrossThreadCall<void>([&, format]{
-            js_ReportErrorVA(cx, JSREPORT_ERROR, format, ap);
-        });
-
-        va_end(ap);
-    }
-    else
-    {
-        va_list ap;
-
-        AssertHeapIsIdle(cx);
-        va_start(ap, format);
-        js_ReportErrorVA(cx, JSREPORT_ERROR, format, ap);
-        va_end(ap);
-    }
+    AssertHeapIsIdle(cx);
+    va_start(ap, format);
+    js_ReportErrorVA(cx, JSREPORT_ERROR, format, ap);
+    va_end(ap);
 }
 
 JS_PUBLIC_API(void)

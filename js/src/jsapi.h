@@ -1242,10 +1242,6 @@ JS_IsBuiltinFunctionConstructor(JSFunction *fun);
 extern JS_PUBLIC_API(bool)
 JS_Init(void);
 
-// Cocos2dReq
-extern JS_PUBLIC_API(void)
-JS_Update(void);
-
 /**
  * Destroy free-standing resources allocated by SpiderMonkey, not associated
  * with any runtime, context, or other structure.
